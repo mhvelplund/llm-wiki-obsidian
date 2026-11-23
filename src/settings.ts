@@ -130,7 +130,10 @@ export class LlmWikiSettingTab extends PluginSettingTab {
       .addText((t) => {
         t.inputEl.type = "password";
         t.setPlaceholder(has ? "stored; type to replace" : "").onChange((v) => {
-          if (v) this.plugin.secrets.set(id, v);
+          if (v) {
+            this.plugin.secrets.set(id, v);
+            this.plugin.onSettingsChanged();
+          }
         });
       });
   }
