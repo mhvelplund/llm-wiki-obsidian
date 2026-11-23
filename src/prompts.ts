@@ -32,7 +32,7 @@ export function savePrompt(opts: SavePromptOpts): string {
         "<answer>\n" + (lastAnswer ?? "") + "\n</answer>"
       : "Content basis: synthesize the conversation so far into the page.";
   const folderNote = newFolder
-    ? `\n\nThe target folder is new: create its index.md as CLAUDE.md requires.`
+    ? " The target folder is new: create its index.md as CLAUDE.md requires."
     : "";
   const steps = [
     `1. Write the page at ${targetPath} in the CLAUDE.md page format. Sources are the source files and wiki pages you actually relied on, with source links at the SHA from sha.log. Set Last updated to ${today} plus that SHA.`,
@@ -44,12 +44,8 @@ export function savePrompt(opts: SavePromptOpts): string {
   return [
     `Save this as a wiki page at the repo-relative path ${targetPath}.${folderNote}`,
     basis,
-    "Steps:
-" + steps.join("
-"),
-  ].join("
-
-");
+    "Steps:\n" + steps.join("\n"),
+  ].join("\n\n");
 }
 
 export const INGEST_PROMPT = "Update the wiki and lint it.";
