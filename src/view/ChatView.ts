@@ -1,4 +1,4 @@
-import { ItemView, MarkdownRenderer, type WorkspaceLeaf, setTooltip } from "obsidian";
+import { ItemView, MarkdownRenderer, Notice, TFile, type WorkspaceLeaf, setTooltip } from "obsidian";
 import type { Engine, EngineEvent } from "../engine/Engine";
 import type LlmWikiChatPlugin from "../main";
 import { validateRepo } from "../repo";
@@ -26,6 +26,10 @@ export class ChatView extends ItemView {
   private actionBtns = new Map<ChatAction, HTMLButtonElement>();
   private busy = false;
   private abort: AbortController | null = null;
+  /** Bumped by New chat; a run whose generation is stale must not touch transcript or DOM. */
+  private generation = 0;
+  private runPromise: Promise<void> | null = null;
+  private pendingReset: Promise<void> = Promise.resolve();
 
   constructor(leaf: WorkspaceLeaf, private readonly plugin: LlmWikiChatPlugin) {
     super(leaf);
@@ -132,11 +136,19 @@ export class ChatView extends ItemView {
   }
 
   private newChat(): void {
+    this.generation++;
     this.abort?.abort();
-    const engine = this.plugin.getEngine();
-    if (!("error" in engine)) engine.reset();
+    this.abort = null;
+    // Reset only after the aborted run has finished draining, so it cannot corrupt the fresh session.
+    const draining = this.runPromise;
+    this.pendingReset = (async () => {
+      await draining?.catch(() => {});
+      const engine = this.plugin.getEngine();
+      if (!("error" in engine)) engine.reset();
+    })();
     this.transcript = [];
     this.messagesEl.empty();
+    this.refreshControls();
   }
 
   private sendOrStop(): void {
@@ -159,25 +171,34 @@ export class ChatView extends ItemView {
     });
     this.scrollToEnd();
 
-    const engine = this.plugin.getEngine();
-    const repo = validateRepo(this.plugin.getRepoRoot());
-    if ("error" in engine) return this.showError(engine.error);
-    if (!repo.ok) return this.showError(repo.reason);
-
+    const gen = this.generation;
     const abort = new AbortController();
-    this.abort = abort;
+    this.abort = abort; // set synchronously so Stop works and double sends are blocked
     this.refreshControls();
+    const run = (async () => {
+      await this.pendingReset;
+      if (gen !== this.generation) return;
+      const engine = this.plugin.getEngine();
+      const repo = validateRepo(this.plugin.getRepoRoot());
+      if ("error" in engine) return this.showError(engine.error);
+      if (!repo.ok) return this.showError(repo.reason);
+      try {
+        await this.streamAnswer(engine, prompt, abort.signal, gen);
+      } catch (e) {
+        if (gen === this.generation) this.showError(e instanceof Error ? e.message : String(e));
+      }
+    })();
+    this.runPromise = run;
     try {
-      await this.streamAnswer(engine, prompt, abort.signal);
-    } catch (e) {
-      this.showError(e instanceof Error ? e.message : String(e));
+      await run;
     } finally {
-      this.abort = null;
+      if (this.abort === abort) this.abort = null;
+      if (this.runPromise === run) this.runPromise = null;
       this.refreshControls();
     }
   }
 
-  private async streamAnswer(engine: Engine, prompt: string, signal: AbortSignal): Promise<void> {
+  private async streamAnswer(engine: Engine, prompt: string, signal: AbortSignal, gen: number): Promise<void> {
     const msgEl = this.messagesEl.createDiv({ cls: "llm-wiki-msg llm-wiki-assistant" });
     let toolsEl: HTMLDetailsElement | null = null;
     let summaryEl: HTMLElement | null = null;
@@ -223,6 +244,7 @@ export class ChatView extends ItemView {
       if (timer !== null) window.clearTimeout(timer);
       timer = null;
     }
+    if (gen !== this.generation) return; // New chat happened mid-run: discard everything
 
     if (terminal?.type === "error") {
       if (text === "") msgEl.remove();
@@ -271,6 +293,12 @@ export class ChatView extends ItemView {
     if (target === null) return; // external: default handling
     e.preventDefault();
     e.stopPropagation();
+    // Never let a hallucinated link create a note: only open pages that exist.
+    const path = target.split("#")[0]!;
+    if (!(this.app.vault.getAbstractFileByPath(path) instanceof TFile)) {
+      new Notice(`Page not found: ${path}`);
+      return;
+    }
     void this.app.workspace.openLinkText(target, "", e.ctrlKey || e.metaKey);
   }
 
