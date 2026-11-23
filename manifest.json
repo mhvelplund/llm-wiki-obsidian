@@ -1,0 +1,9 @@
+{
+  "id": "llm-wiki-chat",
+  "name": "LLM Wiki Chat",
+  "version": "0.1.0",
+  "minAppVersion": "1.11.4",
+  "description": "Claude chat sidebar over an llm-wiki vault.",
+  "author": "llm-wiki",
+  "isDesktopOnly": true
+}
