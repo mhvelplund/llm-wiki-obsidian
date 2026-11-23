@@ -1,17 +1,19 @@
 import { FileSystemAdapter, Notice, Plugin, type WorkspaceLeaf } from "obsidian";
 import type { Engine } from "./engine/Engine";
-import { createEngine } from "./engine/createEngine";
+import { createEngine, engineFingerprint } from "./engine/createEngine";
 import { listWikiFolders, resolveDefaultRepoRoot, validateRepo } from "./repo";
-import { RunController } from "./runController";
+import { RunController, type ControllerEvent } from "./runController";
 import { createSecrets, type Secrets } from "./secrets";
 import { DEFAULT_SETTINGS, LlmWikiSettingTab, type LlmWikiSettings } from "./settings";
-import { ChatView, VIEW_TYPE, type ChatAction } from "./view/ChatView";
+import { BUSY_MESSAGE, ChatView, VIEW_TYPE, type ChatAction } from "./view/ChatView";
 import { SaveModal, suggestName } from "./view/SaveModal";
 
 export default class LlmWikiChatPlugin extends Plugin {
   settings: LlmWikiSettings = { ...DEFAULT_SETTINGS };
   secrets!: Secrets;
   private engine: Engine | { error: string } | null = null;
+  /** engineFingerprint of the settings the cached engine was built from. */
+  private engineFp = "";
   private controller: { engine: Engine; controller: RunController } | null = null;
 
   async onload(): Promise<void> {
@@ -46,12 +48,51 @@ export default class LlmWikiChatPlugin extends Plugin {
     this.onSettingsChanged();
   }
 
-  /** Drop the cached engine (config or secrets changed) and refresh open chat views. */
+  /**
+   * Settings or secrets changed: refresh open chat views. The engine is rebuilt lazily by
+   * syncEngine when the next run starts, so typing in a text field does not end the chat.
+   */
   onSettingsChanged(): void {
+    for (const view of this.chatViews()) view.refreshEngineUi();
+  }
+
+  private chatViews(): ChatView[] {
+    return this.app.workspace
+      .getLeavesOfType(VIEW_TYPE)
+      .map((leaf) => leaf.view)
+      .filter((v): v is ChatView => v instanceof ChatView);
+  }
+
+  private currentFingerprint(): string {
+    return engineFingerprint(this.settings, this.getRepoRoot(), this.secrets);
+  }
+
+  /** True while any run (chat, save or ingest) is in flight. */
+  isBusy(): boolean {
+    return this.controller?.controller.busy === true || this.chatViews().some((v) => v.running);
+  }
+
+  /**
+   * Called before a run starts: drops the cached engine if engine-relevant settings changed
+   * since it was built. Never while a run is in flight (the swap waits for a later run).
+   * Returns true when a working engine, and so its conversation, was replaced; open chat
+   * views then start a new conversation.
+   */
+  syncEngine(): boolean {
+    if (this.engine === null || this.isBusy()) return false;
+    if (this.currentFingerprint() === this.engineFp) return false;
+    const replaced = !("error" in this.engine);
     this.engine = null;
-    for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE)) {
-      if (leaf.view instanceof ChatView) leaf.view.refreshEngineUi();
+    this.controller = null;
+    if (replaced) {
+      for (const view of this.chatViews()) view.startNewConversation("Settings changed — new conversation.");
     }
+    return replaced;
+  }
+
+  /** Forgets the current conversation without building an engine just to reset it. */
+  resetConversation(): void {
+    if (this.engine && !("error" in this.engine)) this.engine.reset();
   }
 
   getRepoRoot(): string {
@@ -67,7 +108,10 @@ export default class LlmWikiChatPlugin extends Plugin {
 
   /** The cached engine, so the conversation survives across turns. Errors are not cached. */
   getEngine(): Engine | { error: string } {
-    if (this.engine === null || "error" in this.engine) this.engine = this.buildEngine();
+    if (this.engine === null || "error" in this.engine) {
+      this.engineFp = this.currentFingerprint();
+      this.engine = this.buildEngine();
+    }
     return this.engine;
   }
 
@@ -88,11 +132,9 @@ export default class LlmWikiChatPlugin extends Plugin {
       view.showError(msg);
       return;
     }
-    const controller = this.getController();
-    if ("error" in controller) return view.showError(controller.error);
-    if (controller.busy) return view.showError("A run is already in progress");
+    if (this.isBusy()) return view.showError(BUSY_MESSAGE);
     if (a === "ingest") {
-      void view.runStream((signal) => controller.ingest(signal), false);
+      this.startRun(view, (c, signal) => c.ingest(signal));
       return;
     }
     const root = this.getRepoRoot();
@@ -109,20 +151,32 @@ export default class LlmWikiChatPlugin extends Plugin {
       new Notice("Nothing to synthesize yet");
       return;
     }
+    const source = a === "save-last" ? "last" : "synthesis";
     const suggested = lastAnswer !== undefined ? suggestName(lastAnswer) : "";
     new SaveModal(
       this.app,
       listWikiFolders(root),
       suggested,
-      (folder, name) => {
-        void view.runStream(
-          (signal) =>
-            controller.save({ source: a === "save-last" ? "last" : "synthesis", lastAnswer, folder, name }, signal),
-          false,
-        );
-      },
+      (folder, name) =>
+        this.startRun(view, (c, signal) => c.save({ source, lastAnswer, folder, name }, signal), source === "synthesis"),
       root,
     ).open();
+  }
+
+  /**
+   * Starts a save/ingest run, fetching the controller now (not when a modal opened), since a
+   * run may have started or the settings may have changed in between.
+   */
+  private startRun(
+    view: ChatView,
+    start: (c: RunController, signal: AbortSignal) => AsyncIterable<ControllerEvent>,
+    needsConversation = false,
+  ): void {
+    if (this.isBusy()) return view.showError(BUSY_MESSAGE);
+    if (this.syncEngine() && needsConversation) return; // the conversation to synthesize is gone
+    const controller = this.getController();
+    if ("error" in controller) return view.showError(controller.error);
+    void view.runStream((signal) => start(controller, signal), false);
   }
 
   private async activateView(): Promise<ChatView | null> {

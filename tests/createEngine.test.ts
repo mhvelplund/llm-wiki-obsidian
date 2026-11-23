@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { createEngine } from "../src/engine/createEngine";
+import { createEngine, engineFingerprint } from "../src/engine/createEngine";
 import { DEFAULT_SETTINGS, type LlmWikiSettings } from "../src/engine/settingsTypes";
 
 const secrets = (m: Record<string, string>) => ({ get: (id: string) => m[id] ?? null });
@@ -30,5 +30,38 @@ describe("createEngine", () => {
     expect(envOf(off)).not.toHaveProperty("ANTHROPIC_API_KEY");
     const on = createEngine({ ...DEFAULT_SETTINGS, useApiKeyForCli: true }, "/repo", secrets(m));
     expect(envOf(on).ANTHROPIC_API_KEY).toBe("k");
+  });
+});
+
+describe("engineFingerprint", () => {
+  const fp = (s: Partial<LlmWikiSettings>, m: Record<string, string> = {}, root = "/repo") =>
+    engineFingerprint({ ...DEFAULT_SETTINGS, ...s }, root, secrets(m));
+
+  it("is stable for identical settings", () => {
+    expect(fp({}, { "oauth-token": "t" })).toBe(fp({}, { "oauth-token": "t" }));
+  });
+
+  it("changes with each engine-relevant field of the claude-code engine", () => {
+    const base = fp({});
+    expect(fp({ engine: "api" })).not.toBe(base);
+    expect(fp({}, {}, "/other")).not.toBe(base);
+    expect(fp({ cliPath: "x" })).not.toBe(base);
+    expect(fp({ cliModel: "opus" })).not.toBe(base);
+    expect(fp({ maxBudgetUsd: 2 })).not.toBe(base);
+    expect(fp({ useApiKeyForCli: true })).not.toBe(base);
+    expect(fp({}, { "oauth-token": "t" })).not.toBe(base);
+  });
+
+  it("ignores fields the selected engine does not use", () => {
+    expect(fp({ apiModel: "other" })).toBe(fp({}));
+    expect(fp({}, { "api-key": "k" })).toBe(fp({})); // CLI without useApiKeyForCli
+    expect(fp({ engine: "api", cliModel: "opus" })).toBe(fp({ engine: "api" }));
+  });
+
+  it("changes with the API key and model for the api engine", () => {
+    const base = fp({ engine: "api" }, { "api-key": "a" });
+    expect(fp({ engine: "api" }, { "api-key": "b" })).not.toBe(base);
+    expect(fp({ engine: "api", apiModel: "m2" }, { "api-key": "a" })).not.toBe(base);
+    expect(fp({ engine: "api", useApiKeyForCli: true }, { "api-key": "a" })).toBe(base);
   });
 });

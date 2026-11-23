@@ -9,6 +9,7 @@ async function* errorStream(message: string): AsyncIterable<EngineEvent> {
 }
 
 export const VIEW_TYPE = "llm-wiki-chat-view";
+export const BUSY_MESSAGE = "A run is already in progress";
 
 export type ChatAction = "save-last" | "save-synthesis" | "ingest";
 export interface TranscriptEntry {
@@ -17,6 +18,9 @@ export interface TranscriptEntry {
 }
 
 const RENDER_INTERVAL_MS = 100;
+/** How long to wait for the vault to index a page a run just created before giving up. */
+const OPEN_RETRY_MS = 1000;
+const OPEN_POLL_MS = 100;
 const INGEST_DISABLED_TIP = "Requires the Claude Code engine";
 
 export class ChatView extends ItemView {
@@ -28,12 +32,13 @@ export class ChatView extends ItemView {
   private inputEl!: HTMLTextAreaElement;
   private sendBtn!: HTMLButtonElement;
   private actionBtns = new Map<ChatAction, HTMLButtonElement>();
-  private busy = false;
   private abort: AbortController | null = null;
   /** Bumped by New chat; a run whose generation is stale must not touch transcript or DOM. */
   private generation = 0;
   private runPromise: Promise<void> | null = null;
   private pendingReset: Promise<void> = Promise.resolve();
+  /** Latest render request per element, so a slow earlier render cannot overwrite a later one. */
+  private renderSeq = new WeakMap<HTMLElement, number>();
 
   constructor(leaf: WorkspaceLeaf, private readonly plugin: LlmWikiChatPlugin) {
     super(leaf);
@@ -64,9 +69,9 @@ export class ChatView extends ItemView {
     this.scrollToEnd();
   }
 
-  setBusy(b: boolean): void {
-    this.busy = b;
-    this.refreshControls();
+  /** True while a run started in this pane is in flight (until it ends or is discarded). */
+  get running(): boolean {
+    return this.abort !== null;
   }
 
   /** Called by the plugin when settings change: update badge and ingest availability. */
@@ -122,24 +127,38 @@ export class ChatView extends ItemView {
   }
 
   async onClose(): Promise<void> {
-    this.abort?.abort();
+    // A reopened, empty pane must not silently resume this conversation.
+    this.discardConversation();
   }
 
   private refreshControls(): void {
     if (!this.sendBtn) return;
-    const running = this.abort !== null;
+    const running = this.running;
     this.sendBtn.setText(running ? "Stop" : "Send");
     this.sendBtn.toggleClass("mod-warning", running);
     this.sendBtn.toggleClass("mod-cta", !running);
-    this.sendBtn.disabled = this.busy && !running;
     const apiEngine = this.plugin.settings.engine === "api";
     for (const [action, btn] of this.actionBtns) {
-      btn.disabled = this.busy || running || (action === "ingest" && apiEngine);
+      btn.disabled = running || (action === "ingest" && apiEngine);
       if (action === "ingest") setTooltip(btn, apiEngine ? INGEST_DISABLED_TIP : "Run the ingest workflow");
     }
   }
 
   private newChat(): void {
+    this.discardConversation();
+    this.transcript = [];
+    this.messagesEl.empty();
+    this.refreshControls();
+  }
+
+  /** Called by the plugin when it replaced the engine: the old conversation is gone. */
+  startNewConversation(note: string): void {
+    this.newChat();
+    this.showNote(note);
+  }
+
+  /** Stops any run, ignores its output, and resets the engine's session once it has drained. */
+  private discardConversation(): void {
     this.generation++;
     this.abort?.abort();
     this.abort = null;
@@ -147,12 +166,8 @@ export class ChatView extends ItemView {
     const draining = this.runPromise;
     this.pendingReset = (async () => {
       await draining?.catch(() => {});
-      const engine = this.plugin.getEngine();
-      if (!("error" in engine)) engine.reset();
+      this.plugin.resetConversation();
     })();
-    this.transcript = [];
-    this.messagesEl.empty();
-    this.refreshControls();
   }
 
   private sendOrStop(): void {
@@ -160,9 +175,9 @@ export class ChatView extends ItemView {
       this.abort.abort();
       return;
     }
-    if (this.busy) return;
     const prompt = this.inputEl.value.trim();
     if (prompt === "") return;
+    this.plugin.syncEngine();
     this.inputEl.value = "";
     this.transcript.push({ role: "user", text: prompt });
     this.messagesEl.createDiv({ cls: "llm-wiki-msg llm-wiki-user" }).createDiv({
@@ -181,7 +196,10 @@ export class ChatView extends ItemView {
    * transcript; save/ingest runs end in a report (appended via appendReport) instead.
    */
   runStream(start: (signal: AbortSignal) => AsyncIterable<ControllerEvent>, record: boolean): Promise<void> {
-    if (this.abort) return Promise.resolve();
+    if (this.running) {
+      this.showError(BUSY_MESSAGE);
+      return Promise.resolve();
+    }
     const gen = this.generation;
     const abort = new AbortController();
     this.abort = abort; // set synchronously so Stop works and double sends are blocked
@@ -265,7 +283,7 @@ export class ChatView extends ItemView {
       if (terminal?.type === "error") this.showError(terminal.message);
       if (report) {
         this.appendReport(report.markdown);
-        if (report.openPath) void this.app.workspace.openLinkText(report.openPath, "", true);
+        if (report.openPath) void this.openCreatedPage(report.openPath);
       }
       return;
     }
@@ -301,9 +319,28 @@ export class ChatView extends ItemView {
   }
 
   private async renderMarkdown(el: HTMLElement, md: string): Promise<void> {
+    const seq = (this.renderSeq.get(el) ?? 0) + 1;
+    this.renderSeq.set(el, seq);
     const tmp = createDiv();
     await MarkdownRenderer.render(this.app, md, tmp, "", this);
+    if (this.renderSeq.get(el) !== seq) return; // a newer render of this element won
     el.replaceChildren(...Array.from(tmp.childNodes));
+  }
+
+  private isPage(path: string): boolean {
+    return this.app.vault.getAbstractFileByPath(path) instanceof TFile;
+  }
+
+  /** Opens a page a run just wrote, waiting briefly for the vault to index it. Never creates a note. */
+  private async openCreatedPage(path: string): Promise<void> {
+    for (let waited = 0; !this.isPage(path); waited += OPEN_POLL_MS) {
+      if (waited >= OPEN_RETRY_MS) {
+        new Notice(`Page not found: ${path}`);
+        return;
+      }
+      await sleep(OPEN_POLL_MS);
+    }
+    await this.app.workspace.openLinkText(path, "", true);
   }
 
   /** Answers link relative to the wiki; open them as vault pages. */
@@ -318,7 +355,7 @@ export class ChatView extends ItemView {
     e.stopPropagation();
     // Never let a hallucinated link create a note: only open pages that exist.
     const path = target.split("#")[0]!;
-    if (!(this.app.vault.getAbstractFileByPath(path) instanceof TFile)) {
+    if (!this.isPage(path)) {
       new Notice(`Page not found: ${path}`);
       return;
     }

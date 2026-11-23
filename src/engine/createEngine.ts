@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { Engine } from "./Engine";
 import { ApiEngine, createAnthropicClient } from "./ApiEngine";
 import { ClaudeCodeEngine } from "./ClaudeCodeEngine";
@@ -27,4 +28,29 @@ export function createEngine(
     maxBudgetUsd: s.maxBudgetUsd ?? undefined,
     env,
   });
+}
+
+/**
+ * Hash of everything the engine built by createEngine depends on, for the selected engine
+ * only. A changed fingerprint means the cached engine (and its conversation) is stale.
+ */
+export function engineFingerprint(
+  s: LlmWikiSettings,
+  repoRoot: string,
+  secrets: { get(id: SecretId): string | null },
+): string {
+  const parts =
+    s.engine === "api"
+      ? ["api", repoRoot, s.apiModel, secrets.get("api-key")]
+      : [
+          "claude-code",
+          repoRoot,
+          s.cliPath,
+          s.cliModel,
+          s.maxBudgetUsd,
+          s.useApiKeyForCli,
+          secrets.get("oauth-token"),
+          s.useApiKeyForCli ? secrets.get("api-key") : null,
+        ];
+  return createHash("sha256").update(JSON.stringify(parts)).digest("hex");
 }

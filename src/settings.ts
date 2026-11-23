@@ -135,7 +135,17 @@ export class LlmWikiSettingTab extends PluginSettingTab {
             this.plugin.onSettingsChanged();
           }
         });
-      });
+      })
+      .addButton((b) =>
+        b
+          .setButtonText("Clear")
+          .setDisabled(!has)
+          .onClick(() => {
+            this.plugin.secrets.set(id, "");
+            this.plugin.onSettingsChanged();
+            this.display();
+          }),
+      );
   }
 
   private async testConnection(): Promise<string> {
