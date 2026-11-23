@@ -1,45 +1,64 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import type { Engine, EngineEvent, RunRequest } from "./Engine";
 import { parseStreamLine } from "./streamJson";
-import { pluginPreamble, type RunKind } from "../prompts";
+import { basePreamble, cliPrompt, type RunKind } from "../prompts";
 
 const READ_TOOLS = ["Read", "Glob", "Grep"];
-const SAVE_TOOLS = [
+/** Built-in tools available to save/ingest; what they may touch is decided by the rules below. */
+const WRITE_BUILTINS = [...READ_TOOLS, "Edit", "Write", "Bash"];
+const SAVE_ALLOW = [
   ...READ_TOOLS,
-  "Edit",
-  "Write",
+  "Edit(./wiki/**)",
   "Bash(node --experimental-strip-types tools/*)",
+];
+const INGEST_ALLOW = [
+  ...SAVE_ALLOW,
+  "Edit(./sha.log)",
+  "Bash(git status:*)",
+  "Bash(git log:*)",
+  "Bash(git diff:*)",
+  "Bash(git rev-parse:*)",
+  "Bash(git -C sources/* log *)",
+  "Bash(git -C sources/* diff *)",
+  "Bash(git -C sources/* rev-parse *)",
+  "Bash(git -C sources/* show *)",
+  "Bash(git submodule update:*)",
+  "Bash(git submodule status:*)",
+];
+/** wiki/.obsidian may hold other plugins' secrets: never readable (all kinds). */
+const NO_OBSIDIAN_READ = "Read(./wiki/.obsidian/**)";
+const PROTECTED_EDITS = [
+  "Edit(./sources/**)",
+  "Edit(./CLAUDE.md)",
+  "Edit(./tools/**)",
+  "Edit(./.claude/**)",
+  "Edit(./.git/**)",
+  "Edit(./.gitmodules)",
+  "Edit(./wiki/.obsidian/**)",
 ];
 const NO_COMMIT = [
   "Bash(git commit:*)",
   "Bash(git push:*)",
   "Bash(git reset:*)",
   "Bash(git checkout:*)",
-  "Bash(git -C * commit:*)",
-  "Bash(git -C * push:*)",
-  "Bash(git -C * reset:*)",
-  "Bash(git -C * checkout:*)",
-];
-const SAVE_BUILTINS = [...READ_TOOLS, "Edit", "Write", "Bash"];
-const GIT_TOOLS = [
-  "Bash(git status:*)",
-  "Bash(git log:*)",
-  "Bash(git diff:*)",
-  "Bash(git rev-parse:*)",
-  "Bash(git -C sources/*)",
-  "Bash(git submodule update:*)",
-  "Bash(git submodule status:*)",
+  "Bash(git -C * commit *)",
+  "Bash(git -C * push *)",
+  "Bash(git -C * reset *)",
+  "Bash(git -C * checkout *)",
+  // `-c` could set an alias or hook that turns an allowed subcommand into anything.
+  "Bash(git -C * -c *)",
+  "Bash(git -c *)",
 ];
 
 export function buildClaudeArgs(opts: {
   kind: RunKind;
-  prompt: string;
   model: string;
   sessionId?: string;
   maxBudgetUsd?: number;
 }): string[] {
   // The prompt is sent on stdin, never argv (a prompt starting with "-" would
-  // be parsed as an option).
+  // be parsed as an option). The system prompt is kind-neutral because a resumed
+  // session keeps its first system prompt; kind instructions go with the prompt.
   const args = [
     "-p",
     "--output-format",
@@ -49,37 +68,51 @@ export function buildClaudeArgs(opts: {
     "--model",
     opts.model,
     "--append-system-prompt",
-    pluginPreamble(opts.kind),
+    basePreamble(),
   ];
   if (opts.sessionId) args.push("--resume", opts.sessionId);
   if (opts.maxBudgetUsd !== undefined) args.push("--max-budget-usd", String(opts.maxBudgetUsd));
+  // dontAsk: anything not pre-approved below is denied without prompting.
+  args.push("--permission-mode", "dontAsk");
   if (opts.kind === "chat") {
     args.push(
       "--tools",
       ...READ_TOOLS,
-      "--permission-mode",
-      "default",
       "--allowedTools",
       ...READ_TOOLS,
       "--disallowedTools",
       "Edit",
       "Write",
       "Bash",
+      NO_OBSIDIAN_READ,
     );
   } else {
-    const tools = opts.kind === "ingest" ? [...SAVE_TOOLS, ...GIT_TOOLS] : SAVE_TOOLS;
+    const deny = [NO_OBSIDIAN_READ, ...PROTECTED_EDITS, ...NO_COMMIT];
+    if (opts.kind === "save") deny.push("Edit(./sha.log)");
     args.push(
       "--tools",
-      ...SAVE_BUILTINS,
-      "--permission-mode",
-      "acceptEdits",
+      ...WRITE_BUILTINS,
       "--allowedTools",
-      ...tools,
+      ...(opts.kind === "ingest" ? INGEST_ALLOW : SAVE_ALLOW),
       "--disallowedTools",
-      ...NO_COMMIT,
+      ...deny,
     );
   }
   return args;
+}
+
+/**
+ * Child env: the parent's env minus inherited API credentials (they would override the
+ * CLI's own login), plus the credentials the plugin explicitly passes.
+ */
+export function buildChildEnv(
+  parent: NodeJS.ProcessEnv,
+  extra: Record<string, string>,
+): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...parent };
+  delete env.ANTHROPIC_API_KEY;
+  delete env.ANTHROPIC_AUTH_TOKEN;
+  return { ...env, ...extra };
 }
 
 function killTree(child: ChildProcess): void {
@@ -119,7 +152,6 @@ export class ClaudeCodeEngine implements Engine {
       ...(argsPrefix ?? []),
       ...buildClaudeArgs({
         kind: req.kind,
-        prompt: req.prompt,
         model,
         sessionId: this.sessionId,
         maxBudgetUsd,
@@ -159,12 +191,12 @@ export class ClaudeCodeEngine implements Engine {
 
     const child = spawn(cliPath, args, {
       cwd: repoRoot,
-      env: { ...process.env, ...env },
+      env: buildChildEnv(process.env, env),
       windowsHide: true,
       stdio: ["pipe", "pipe", "pipe"],
     });
     child.stdin.on("error", () => {}); // EPIPE if the child dies early
-    child.stdin.end(req.prompt);
+    child.stdin.end(cliPrompt(req.kind, req.prompt));
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
     child.stdout.on("data", (chunk: string) => {

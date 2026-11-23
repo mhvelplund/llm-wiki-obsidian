@@ -3,14 +3,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
-import { ClaudeCodeEngine, buildClaudeArgs } from "../src/engine/ClaudeCodeEngine";
+import { ClaudeCodeEngine, buildChildEnv, buildClaudeArgs } from "../src/engine/ClaudeCodeEngine";
 import type { EngineEvent } from "../src/engine/Engine";
-import { pluginPreamble } from "../src/prompts";
+import { basePreamble, cliPrompt } from "../src/prompts";
 
 const fake = fileURLToPath(new URL("./fixtures/fake-claude.mjs", import.meta.url));
 const fixture = fileURLToPath(new URL("./fixtures/stream-chat.jsonl", import.meta.url));
 
-const base = { prompt: "hello", model: "sonnet" };
+const base = { model: "sonnet" };
 
 function after(args: string[], flag: string, n: number): string[] {
   const i = args.indexOf(flag);
@@ -23,66 +23,83 @@ describe("buildClaudeArgs", () => {
     for (const kind of ["chat", "save", "ingest"] as const) {
       const a = buildClaudeArgs({ ...base, kind });
       expect(a).toContain("-p");
-      expect(a).not.toContain("hello");
       expect(after(a, "--output-format", 1)).toEqual(["stream-json"]);
       expect(a).toContain("--verbose");
       expect(a).toContain("--include-partial-messages");
       expect(after(a, "--model", 1)).toEqual(["sonnet"]);
-      expect(after(a, "--append-system-prompt", 1)).toEqual([pluginPreamble(kind)]);
+      expect(after(a, "--permission-mode", 1)).toEqual(["dontAsk"]);
     }
   });
 
-  it("restricts chat to read-only tools", () => {
-    const a = buildClaudeArgs({ ...base, kind: "chat" });
-    expect(after(a, "--tools", 3)).toEqual(["Read", "Glob", "Grep"]);
-    expect(after(a, "--permission-mode", 1)).toEqual(["default"]);
-    expect(after(a, "--allowedTools", 3)).toEqual(["Read", "Glob", "Grep"]);
-    expect(after(a, "--disallowedTools", 3)).toEqual(["Edit", "Write", "Bash"]);
+  it("uses the same kind-neutral system prompt for every kind (it survives --resume)", () => {
+    for (const kind of ["chat", "save", "ingest"] as const) {
+      expect(after(buildClaudeArgs({ ...base, kind }), "--append-system-prompt", 1)).toEqual([basePreamble()]);
+    }
+    expect(basePreamble()).not.toContain("Do not modify any files");
   });
 
-  const saveTools = [
+  it("restricts chat to read-only tools and hides wiki/.obsidian", () => {
+    const a = buildClaudeArgs({ ...base, kind: "chat" });
+    expect(after(a, "--tools", 3)).toEqual(["Read", "Glob", "Grep"]);
+    expect(after(a, "--allowedTools", 3)).toEqual(["Read", "Glob", "Grep"]);
+    expect(after(a, "--disallowedTools", 4)).toEqual(["Edit", "Write", "Bash", "Read(./wiki/.obsidian/**)"]);
+  });
+
+  const saveAllow = [
     "Read",
     "Glob",
     "Grep",
-    "Edit",
-    "Write",
+    "Edit(./wiki/**)",
     "Bash(node --experimental-strip-types tools/*)",
   ];
 
-  const noCommit = [
+  const writeDeny = [
+    "Read(./wiki/.obsidian/**)",
+    "Edit(./sources/**)",
+    "Edit(./CLAUDE.md)",
+    "Edit(./tools/**)",
+    "Edit(./.claude/**)",
+    "Edit(./.git/**)",
+    "Edit(./.gitmodules)",
+    "Edit(./wiki/.obsidian/**)",
     "Bash(git commit:*)",
     "Bash(git push:*)",
     "Bash(git reset:*)",
     "Bash(git checkout:*)",
-    "Bash(git -C * commit:*)",
-    "Bash(git -C * push:*)",
-    "Bash(git -C * reset:*)",
-    "Bash(git -C * checkout:*)",
+    "Bash(git -C * commit *)",
+    "Bash(git -C * push *)",
+    "Bash(git -C * reset *)",
+    "Bash(git -C * checkout *)",
+    "Bash(git -C * -c *)",
+    "Bash(git -c *)",
   ];
 
-  it("allows edits for save", () => {
+  it("lets save edit only wiki/, never sha.log", () => {
     const a = buildClaudeArgs({ ...base, kind: "save" });
     expect(after(a, "--tools", 6)).toEqual(["Read", "Glob", "Grep", "Edit", "Write", "Bash"]);
-    expect(after(a, "--disallowedTools", 8)).toEqual(noCommit);
-    expect(after(a, "--allowedTools", 6)).toEqual(saveTools);
-    expect(after(a, "--permission-mode", 1)).toEqual(["acceptEdits"]);
+    expect(after(a, "--allowedTools", saveAllow.length + 1)).toEqual([...saveAllow, "--disallowedTools"]);
+    expect(a.slice(a.indexOf("--disallowedTools") + 1)).toEqual([...writeDeny, "Edit(./sha.log)"]);
   });
 
-  it("adds the git allowlist for ingest", () => {
+  it("adds sha.log and the narrow git allowlist for ingest", () => {
     const a = buildClaudeArgs({ ...base, kind: "ingest" });
-    expect(after(a, "--allowedTools", 13)).toEqual([
-      ...saveTools,
+    expect(after(a, "--tools", 6)).toEqual(["Read", "Glob", "Grep", "Edit", "Write", "Bash"]);
+    const allow = [
+      ...saveAllow,
+      "Edit(./sha.log)",
       "Bash(git status:*)",
       "Bash(git log:*)",
       "Bash(git diff:*)",
       "Bash(git rev-parse:*)",
-      "Bash(git -C sources/*)",
+      "Bash(git -C sources/* log *)",
+      "Bash(git -C sources/* diff *)",
+      "Bash(git -C sources/* rev-parse *)",
+      "Bash(git -C sources/* show *)",
       "Bash(git submodule update:*)",
       "Bash(git submodule status:*)",
-    ]);
-    expect(after(a, "--permission-mode", 1)).toEqual(["acceptEdits"]);
-    expect(after(a, "--tools", 6)).toEqual(["Read", "Glob", "Grep", "Edit", "Write", "Bash"]);
-    expect(after(a, "--disallowedTools", 8)).toEqual(noCommit);
+    ];
+    expect(after(a, "--allowedTools", allow.length + 1)).toEqual([...allow, "--disallowedTools"]);
+    expect(a.slice(a.indexOf("--disallowedTools") + 1)).toEqual(writeDeny);
   });
 
   it("adds --resume and --max-budget-usd when given", () => {
@@ -92,6 +109,20 @@ describe("buildClaudeArgs", () => {
     const b = buildClaudeArgs({ ...base, kind: "chat" });
     expect(b).not.toContain("--resume");
     expect(b).not.toContain("--max-budget-usd");
+  });
+});
+
+describe("buildChildEnv", () => {
+  it("drops inherited API credentials", () => {
+    const env = buildChildEnv({ PATH: "p", ANTHROPIC_API_KEY: "inherited", ANTHROPIC_AUTH_TOKEN: "t" }, {});
+    expect(env).toEqual({ PATH: "p" });
+  });
+  it("keeps explicitly provided credentials", () => {
+    const env = buildChildEnv(
+      { PATH: "p", ANTHROPIC_API_KEY: "inherited" },
+      { ANTHROPIC_API_KEY: "mine", CLAUDE_CODE_OAUTH_TOKEN: "tok" },
+    );
+    expect(env).toEqual({ PATH: "p", ANTHROPIC_API_KEY: "mine", CLAUDE_CODE_OAUTH_TOKEN: "tok" });
   });
 });
 
@@ -176,8 +207,23 @@ describe("ClaudeCodeEngine", () => {
     const { engine, invocations } = setup({ FAKE_STDIN_FILE: stdinFile });
     const events = await collect(engine.run({ ...req(), prompt: "--verbose" }));
     expect(events[events.length - 1].type).toBe("done");
-    expect(JSON.parse(readFileSync(stdinFile, "utf8").trim())).toBe("--verbose");
+    expect(JSON.parse(readFileSync(stdinFile, "utf8").trim())).toBe(cliPrompt("chat", "--verbose"));
     expect(invocations()[0].filter((x) => x === "--verbose")).toHaveLength(1); // only the real flag
+  });
+
+  it("sends kind instructions with each prompt, so they apply on a resumed session", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "fake-claude-kind-"));
+    dirs.push(dir);
+    const stdinFile = join(dir, "stdin.jsonl");
+    const { engine, invocations } = setup({ FAKE_STDIN_FILE: stdinFile });
+    await collect(engine.run({ ...req(), kind: "chat", prompt: "q" }));
+    await collect(engine.run({ ...req(), kind: "save", prompt: "s" }));
+    const stdins = readFileSync(stdinFile, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l) as string);
+    expect(stdins).toEqual([cliPrompt("chat", "q"), cliPrompt("save", "s")]);
+    const [first, second] = invocations();
+    expect(second).toContain("--resume");
+    const sys = (a: string[]) => a[a.indexOf("--append-system-prompt") + 1];
+    expect(sys(second)).toBe(sys(first));
   });
 
   it("yields cancelled done when aborted while hanging", async () => {

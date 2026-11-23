@@ -5,11 +5,28 @@ const BASE =
   "Links are relative Markdown links with .md, never [[wikilinks]], no YAML frontmatter. " +
   "Never modify sources/.";
 
-const CHAT_EXTRA =
-  " Do not modify any files; if an answer is worth keeping, say the user can save it.";
+const KIND_CLAUSE: Record<RunKind, string> = {
+  chat: "Do not modify any files; if an answer is worth keeping, say the user can save it.",
+  save: "This is a save run: you may create and edit files under wiki/ only.",
+  ingest: "This is an ingest run: you may update files under wiki/ and sha.log.",
+};
 
+/** The kind-neutral preamble shared by every run. */
+export function basePreamble(): string {
+  return BASE;
+}
+
+/** Full preamble for one run kind (API engine: sent as the system prompt every request). */
 export function pluginPreamble(kind: RunKind): string {
-  return kind === "chat" ? BASE + CHAT_EXTRA : BASE;
+  return BASE + " " + KIND_CLAUSE[kind];
+}
+
+/**
+ * Claude Code keeps the system prompt of a session's first request on --resume, so the
+ * kind-specific clause travels with each user prompt instead.
+ */
+export function cliPrompt(kind: RunKind, prompt: string): string {
+  return KIND_CLAUSE[kind] + "\n\n" + prompt;
 }
 
 export function apiSystemPrompt(claudeMd: string, kind: RunKind): string {
@@ -43,6 +60,7 @@ export function savePrompt(opts: SavePromptOpts): string {
   ];
   return [
     `Save this as a wiki page at the repo-relative path ${targetPath}.${folderNote}`,
+    "Do not modify `sha.log` or anything outside `wiki/`; this is not an ingest.",
     basis,
     "Steps:\n" + steps.join("\n"),
   ].join("\n\n");
