@@ -2,7 +2,7 @@ import type Anthropic from "@anthropic-ai/sdk";
 import {
   lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync,
 } from "node:fs";
-import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 export type ToolMode = "read" | "write";
 export type ToolResult = { content: string; isError: boolean };
@@ -27,9 +27,9 @@ const fold = (seg: string): string => seg.toLowerCase().replace(/[. ]+$/, "");
 function isAllowed(segs: string[], access: "read" | "write"): boolean {
   if (segs.length === 0) return false;
   const [first, second] = segs;
-  if (access === "write") {
-    return first === "wiki" && segs.length > 1 && fold(second) !== ".obsidian";
-  }
+  // wiki/.obsidian/** may hold other plugins' secrets: never readable or writable.
+  if (first === "wiki" && second !== undefined && fold(second) === ".obsidian") return false;
+  if (access === "write") return first === "wiki" && segs.length > 1;
   if (first === "wiki" || first === "sources") return true;
   return segs.length === 1 && READABLE_FILES.has(first);
 }
@@ -187,6 +187,7 @@ export async function executeTool(root: string, mode: ToolMode, name: string, in
       case "list_dir": {
         const dir = resolveInRepo(root, stringField(input, "path"), "read");
         const entries = readdirSync(dir, { withFileTypes: true })
+          .filter((e) => !(fold(e.name) === ".obsidian" && fold(basename(dir)) === "wiki"))
           .map((e) => (e.isDirectory() ? `${e.name}/` : e.name))
           .sort();
         return ok(entries.join("\n"));

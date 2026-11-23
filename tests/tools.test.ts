@@ -92,7 +92,18 @@ describe("executeTool", () => {
   it("list_dir lists entries", async () => {
     const r = await executeTool(repo(), "read", "list_dir", { path: "wiki" });
     expect(r.isError).toBe(false);
-    expect(r.content.split("\n")).toEqual(expect.arrayContaining(["a.md", "sub/", ".obsidian/"]));
+    expect(r.content.split("\n")).toEqual(expect.arrayContaining(["a.md", "sub/"]));
+    expect(r.content).not.toContain(".obsidian");
+  });
+  it("wiki/.obsidian is neither readable nor listable nor searchable", async () => {
+    const root = repo();
+    const run = (tool: string, input: unknown) => executeTool(root, "read", tool, input);
+    expect((await run("read_file", { path: "wiki/.obsidian/plugins/x/data.json" })).isError).toBe(true);
+    expect((await run("read_file", { path: "wiki/.Obsidian/x.md" })).isError).toBe(true);
+    expect((await run("list_dir", { path: "wiki/.obsidian" })).isError).toBe(true);
+    expect((await run("search", { pattern: "foo", path: "wiki/.obsidian" })).isError).toBe(true);
+    expect((await run("search", { pattern: "foo", path: "wiki/.obsidian/x.md" })).isError).toBe(true);
+    expect(() => resolveInRepo(root, "wiki/.obsidian", "read")).toThrow(SandboxError);
   });
   it("search finds matches and skips excluded dirs", async () => {
     const r = await executeTool(repo(), "read", "search", { pattern: "foo" });
