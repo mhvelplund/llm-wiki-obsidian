@@ -90,7 +90,10 @@ export function resolveInRepo(root: string, rel: string, access: "read" | "write
 
 type Def = Anthropic.Beta.BetaTool;
 const str = { type: "string" } as const;
-const nullable = (type: string, description: string) => ({ type: [type, "null"], description });
+const nullable = (type: string, description: string) => ({
+  anyOf: [{ type }, { type: "null" }],
+  description,
+});
 /** Strict schemas require every property in `required`; optional ones are nullable. */
 const schema = (properties: Record<string, unknown>): Def["input_schema"] => ({
   type: "object",
