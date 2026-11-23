@@ -23,7 +23,7 @@ describe("buildClaudeArgs", () => {
     for (const kind of ["chat", "save", "ingest"] as const) {
       const a = buildClaudeArgs({ ...base, kind });
       expect(a).toContain("-p");
-      expect(a).toContain("hello");
+      expect(a).not.toContain("hello");
       expect(after(a, "--output-format", 1)).toEqual(["stream-json"]);
       expect(a).toContain("--verbose");
       expect(a).toContain("--include-partial-messages");
@@ -32,16 +32,12 @@ describe("buildClaudeArgs", () => {
     }
   });
 
-  it("puts the prompt right after -p so variadic flags cannot swallow it", () => {
-    const a = buildClaudeArgs({ ...base, kind: "chat" });
-    expect(a[a.indexOf("-p") + 1]).toBe("hello");
-  });
-
   it("restricts chat to read-only tools", () => {
     const a = buildClaudeArgs({ ...base, kind: "chat" });
+    expect(after(a, "--tools", 3)).toEqual(["Read", "Glob", "Grep"]);
+    expect(after(a, "--permission-mode", 1)).toEqual(["default"]);
     expect(after(a, "--allowedTools", 3)).toEqual(["Read", "Glob", "Grep"]);
     expect(after(a, "--disallowedTools", 3)).toEqual(["Edit", "Write", "Bash"]);
-    expect(a).not.toContain("--permission-mode");
   });
 
   const saveTools = [
@@ -53,8 +49,21 @@ describe("buildClaudeArgs", () => {
     "Bash(node --experimental-strip-types tools/*)",
   ];
 
+  const noCommit = [
+    "Bash(git commit:*)",
+    "Bash(git push:*)",
+    "Bash(git reset:*)",
+    "Bash(git checkout:*)",
+    "Bash(git -C * commit:*)",
+    "Bash(git -C * push:*)",
+    "Bash(git -C * reset:*)",
+    "Bash(git -C * checkout:*)",
+  ];
+
   it("allows edits for save", () => {
     const a = buildClaudeArgs({ ...base, kind: "save" });
+    expect(after(a, "--tools", 6)).toEqual(["Read", "Glob", "Grep", "Edit", "Write", "Bash"]);
+    expect(after(a, "--disallowedTools", 8)).toEqual(noCommit);
     expect(after(a, "--allowedTools", 6)).toEqual(saveTools);
     expect(after(a, "--permission-mode", 1)).toEqual(["acceptEdits"]);
   });
@@ -72,6 +81,8 @@ describe("buildClaudeArgs", () => {
       "Bash(git submodule status:*)",
     ]);
     expect(after(a, "--permission-mode", 1)).toEqual(["acceptEdits"]);
+    expect(after(a, "--tools", 6)).toEqual(["Read", "Glob", "Grep", "Edit", "Write", "Bash"]);
+    expect(after(a, "--disallowedTools", 8)).toEqual(noCommit);
   });
 
   it("adds --resume and --max-budget-usd when given", () => {
@@ -149,12 +160,24 @@ describe("ClaudeCodeEngine", () => {
     expect((events[0] as { message: string }).message).toContain("no-such-claude-cli");
   });
 
-  it("includes stderr when the CLI exits non-zero without a result", async () => {
-    const { engine } = setup({ FAKE_EXIT: "1", FAKE_STDERR: "not logged in", FAKE_NO_OUTPUT: "1" });
+  it("includes stderr when the CLI exits non-zero", async () => {
+    const { engine } = setup({ FAKE_EXIT: "1", FAKE_STDERR: "not logged in" });
     const events = await collect(engine.run(req()));
-    expect(events).toHaveLength(1);
-    expect(events[0].type).toBe("error");
-    expect((events[0] as { message: string }).message).toContain("not logged in");
+    const last = events[events.length - 1];
+    expect(events.filter((e) => e.type === "done" || e.type === "error")).toHaveLength(1);
+    expect(last.type).toBe("error");
+    expect((last as { message: string }).message).toContain("not logged in");
+  });
+
+  it("sends the prompt on stdin, not argv", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "fake-claude-stdin-"));
+    dirs.push(dir);
+    const stdinFile = join(dir, "stdin.jsonl");
+    const { engine, invocations } = setup({ FAKE_STDIN_FILE: stdinFile });
+    const events = await collect(engine.run({ ...req(), prompt: "--verbose" }));
+    expect(events[events.length - 1].type).toBe("done");
+    expect(JSON.parse(readFileSync(stdinFile, "utf8").trim())).toBe("--verbose");
+    expect(invocations()[0].filter((x) => x === "--verbose")).toHaveLength(1); // only the real flag
   });
 
   it("yields cancelled done when aborted while hanging", async () => {

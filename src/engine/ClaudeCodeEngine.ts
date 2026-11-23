@@ -10,6 +10,17 @@ const SAVE_TOOLS = [
   "Write",
   "Bash(node --experimental-strip-types tools/*)",
 ];
+const NO_COMMIT = [
+  "Bash(git commit:*)",
+  "Bash(git push:*)",
+  "Bash(git reset:*)",
+  "Bash(git checkout:*)",
+  "Bash(git -C * commit:*)",
+  "Bash(git -C * push:*)",
+  "Bash(git -C * reset:*)",
+  "Bash(git -C * checkout:*)",
+];
+const SAVE_BUILTINS = [...READ_TOOLS, "Edit", "Write", "Bash"];
 const GIT_TOOLS = [
   "Bash(git status:*)",
   "Bash(git log:*)",
@@ -27,11 +38,10 @@ export function buildClaudeArgs(opts: {
   sessionId?: string;
   maxBudgetUsd?: number;
 }): string[] {
-  // The prompt must directly follow -p: --allowedTools/--disallowedTools are
-  // variadic and would otherwise swallow a trailing positional prompt.
+  // The prompt is sent on stdin, never argv (a prompt starting with "-" would
+  // be parsed as an option).
   const args = [
     "-p",
-    opts.prompt,
     "--output-format",
     "stream-json",
     "--verbose",
@@ -44,10 +54,30 @@ export function buildClaudeArgs(opts: {
   if (opts.sessionId) args.push("--resume", opts.sessionId);
   if (opts.maxBudgetUsd !== undefined) args.push("--max-budget-usd", String(opts.maxBudgetUsd));
   if (opts.kind === "chat") {
-    args.push("--allowedTools", ...READ_TOOLS, "--disallowedTools", "Edit", "Write", "Bash");
+    args.push(
+      "--tools",
+      ...READ_TOOLS,
+      "--permission-mode",
+      "default",
+      "--allowedTools",
+      ...READ_TOOLS,
+      "--disallowedTools",
+      "Edit",
+      "Write",
+      "Bash",
+    );
   } else {
     const tools = opts.kind === "ingest" ? [...SAVE_TOOLS, ...GIT_TOOLS] : SAVE_TOOLS;
-    args.push("--permission-mode", "acceptEdits", "--allowedTools", ...tools);
+    args.push(
+      "--tools",
+      ...SAVE_BUILTINS,
+      "--permission-mode",
+      "acceptEdits",
+      "--allowedTools",
+      ...tools,
+      "--disallowedTools",
+      ...NO_COMMIT,
+    );
   }
   return args;
 }
@@ -131,8 +161,10 @@ export class ClaudeCodeEngine implements Engine {
       cwd: repoRoot,
       env: { ...process.env, ...env },
       windowsHide: true,
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: ["pipe", "pipe", "pipe"],
     });
+    child.stdin.on("error", () => {}); // EPIPE if the child dies early
+    child.stdin.end(req.prompt);
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
     child.stdout.on("data", (chunk: string) => {
@@ -186,14 +218,14 @@ export class ClaudeCodeEngine implements Engine {
       };
     } else if (req.signal.aborted) {
       yield { type: "done", text: streamed, cancelled: true };
-    } else if (terminal) {
+    } else if (terminal && (terminal.type === "error" || exitCode === 0 || exitCode === null)) {
       yield terminal;
     } else {
       const detail = stderr.trim();
       yield {
         type: "error",
         message:
-          `Claude Code exited with code ${exitCode} without a result` + (detail ? `: ${detail}` : ""),
+          `Claude Code exited with code ${exitCode} ${terminal ? "after a result" : "without a result"}` + (detail ? `: ${detail}` : ""),
       };
     }
   }
