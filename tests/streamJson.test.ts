@@ -54,6 +54,19 @@ describe("parseStreamLine", () => {
     expect(parseStreamLine(line)).toEqual([{ type: "error", message: "boom" }]);
   });
 
+  it("names the subtype of an error result without text", () => {
+    const line = JSON.stringify({ type: "result", subtype: "error_max_budget_usd", is_error: true });
+    expect(parseStreamLine(line)).toEqual([
+      { type: "error", message: "Claude Code reported an error (error_max_budget_usd)" },
+    ]);
+    const notFlagged = JSON.stringify({ type: "result", subtype: "error_max_turns", is_error: false });
+    expect(parseStreamLine(notFlagged)).toEqual([
+      { type: "error", message: "Claude Code reported an error (error_max_turns)" },
+    ]);
+    const bare = JSON.stringify({ type: "result", is_error: true, result: "" });
+    expect(parseStreamLine(bare)).toEqual([{ type: "error", message: "Claude Code reported an error" }]);
+  });
+
   it("returns [] for unknown or invalid lines", () => {
     expect(parseStreamLine("")).toEqual([]);
     expect(parseStreamLine("not json")).toEqual([]);

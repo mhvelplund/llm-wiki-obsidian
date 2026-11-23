@@ -15,6 +15,17 @@ describe("snapshotWiki", () => {
   });
 });
 
+describe("snapshotWiki sha.log", () => {
+  it("includes sha.log at the repo root so reports show it", () => {
+    const root = makeTmpRepo({ "wiki/index.md": "a", "sha.log": "abc", "CLAUDE.md": "c" });
+    expect([...snapshotWiki(root).keys()].sort()).toEqual(["sha.log", "wiki/index.md"]);
+    const before = snapshotWiki(root);
+    const future = new Date(Date.now() + 10_000);
+    utimesSync(join(root, "sha.log"), future, future);
+    expect(diffSnapshots(before, snapshotWiki(root)).modified).toEqual(["sha.log"]);
+  });
+});
+
 describe("diffSnapshots", () => {
   it("reports created, modified and deleted files", () => {
     const root = makeTmpRepo({ "wiki/keep.md": "k", "wiki/touch.md": "t", "wiki/gone.md": "g" });

@@ -55,8 +55,10 @@ export function parseStreamLine(line: string): EngineEvent[] | { sessionId: stri
     }
     case "result": {
       const text = typeof obj.result === "string" ? obj.result : "";
-      if (obj.is_error === true) {
-        return [{ type: "error", message: text || "Claude Code reported an error" }];
+      const subtype = typeof obj.subtype === "string" ? obj.subtype : "";
+      // Error subtypes (error_max_turns, error_max_budget_usd, ...) carry no result text.
+      if (obj.is_error === true || subtype.startsWith("error")) {
+        return [{ type: "error", message: text || `Claude Code reported an error${subtype ? ` (${subtype})` : ""}` }];
       }
       const done: EngineEvent = { type: "done", text };
       if (typeof obj.total_cost_usd === "number") done.costUsd = obj.total_cost_usd;

@@ -71,8 +71,15 @@ export class ApiEngine implements Engine {
           },
           { signal: req.signal },
         );
+        // Text from separate tool turns is joined with a blank line, in the deltas and in done.text alike.
+        let needSeparator = streamed !== "";
         for await (const ev of stream) {
           if (ev.type === "content_block_delta" && ev.delta.type === "text_delta") {
+            if (needSeparator && ev.delta.text !== "") {
+              needSeparator = false;
+              streamed += "\n\n";
+              yield { type: "text-delta", text: "\n\n" };
+            }
             streamed += ev.delta.text;
             yield { type: "text-delta", text: ev.delta.text };
           }

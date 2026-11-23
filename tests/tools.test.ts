@@ -131,6 +131,20 @@ describe("executeTool", () => {
     const r = await executeTool(root, "read", "search", { pattern: "foo" });
     expect(r.content.split("\n")).toHaveLength(200);
   });
+  it("search caps each result line at 500 chars", async () => {
+    const root = makeTmpRepo({ "wiki/long.md": "foo" + "x".repeat(2000) });
+    const r = await executeTool(root, "read", "search", { pattern: "foo" });
+    expect(r.content).toBe("wiki/long.md:1: foo" + "x".repeat(497) + " [line truncated]");
+  });
+  it("read_file truncates files over 256 KB with a marker", async () => {
+    const big = "a".repeat(300 * 1024);
+    const root = makeTmpRepo({ "wiki/big.md": big, "wiki/small.md": "a".repeat(256 * 1024) });
+    const r = await executeTool(root, "read", "read_file", { path: "wiki/big.md" });
+    expect(r.isError).toBe(false);
+    expect(r.content).toBe("a".repeat(256 * 1024) + "\n\n[truncated: showing the first 262144 of 307200 bytes]");
+    const s = await executeTool(root, "read", "read_file", { path: "wiki/small.md" });
+    expect(s.content).toBe("a".repeat(256 * 1024));
+  });
   it("write_file creates (incl. new subfolders), refuses overwrite unless asked", async () => {
     const root = repo();
     const p = "wiki/n/m/c.md";

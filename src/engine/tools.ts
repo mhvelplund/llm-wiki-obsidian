@@ -1,6 +1,6 @@
 import type Anthropic from "@anthropic-ai/sdk";
 import {
-  lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync,
+  closeSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, realpathSync, statSync, writeFileSync,
 } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
@@ -20,6 +20,8 @@ const READABLE_FILES = new Set(["CLAUDE.md", "sha.log", ".gitmodules"]);
 const SEARCH_SKIP_DIRS = new Set([".git", "node_modules"]);
 const MAX_SEARCH_LINES = 200;
 const MAX_SEARCH_FILE_BYTES = 1_000_000;
+const MAX_SEARCH_LINE_CHARS = 500;
+const MAX_READ_BYTES = 256 * 1024;
 
 /** Folds case and trailing dots/spaces so `.OBSIDIAN` / `.obsidian.` match on case-insensitive filesystems. */
 const fold = (seg: string): string => seg.toLowerCase().replace(/[. ]+$/, "");
@@ -111,7 +113,7 @@ const READ_DEFS: Def[] = [
   },
   {
     name: "read_file",
-    description: "Read a text file. Readable: wiki/**, sources/**, CLAUDE.md, sha.log, .gitmodules.",
+    description: `Read a text file (first ${MAX_READ_BYTES / 1024} KB). Readable: wiki/**, sources/**, CLAUDE.md, sha.log, .gitmodules.`,
     strict: true,
     input_schema: schema({ path: { ...str, description: "Repo-relative file path" } }),
   },
@@ -196,7 +198,7 @@ export async function executeTool(root: string, mode: ToolMode, name: string, in
         return ok(entries.join("\n"));
       }
       case "read_file":
-        return ok(readFileSync(resolveInRepo(root, stringField(input, "path"), "read"), "utf8"));
+        return ok(readCapped(resolveInRepo(root, stringField(input, "path"), "read")));
       case "search":
         return ok(search(root, input));
       case "write_file": {
@@ -231,6 +233,23 @@ export async function executeTool(root: string, mode: ToolMode, name: string, in
     return { content: e instanceof Error ? e.message : String(e), isError: true };
   }
 }
+
+/** File text, cut at MAX_READ_BYTES with a marker so one huge file cannot flood the context. */
+function readCapped(file: string): string {
+  const size = statSync(file).size;
+  if (size <= MAX_READ_BYTES) return readFileSync(file, "utf8");
+  const buf = Buffer.alloc(MAX_READ_BYTES);
+  const fd = openSync(file, "r");
+  try {
+    readSync(fd, buf, 0, MAX_READ_BYTES, 0);
+  } finally {
+    closeSync(fd);
+  }
+  return buf.toString("utf8") + `\n\n[truncated: showing the first ${MAX_READ_BYTES} of ${size} bytes]`;
+}
+
+const capLine = (line: string): string =>
+  line.length > MAX_SEARCH_LINE_CHARS ? line.slice(0, MAX_SEARCH_LINE_CHARS) + " [line truncated]" : line;
 
 function search(root: string, input: unknown): string {
   const pattern = stringField(input, "pattern");
@@ -271,7 +290,7 @@ function search(root: string, input: unknown): string {
     const relPosix = toPosix(relative(realRoot, abs));
     const lines = text.split(/\r?\n/);
     for (let i = 0; i < lines.length && out.length < MAX_SEARCH_LINES; i++) {
-      if (matches(lines[i])) out.push(`${relPosix}:${i + 1}: ${lines[i]}`);
+      if (matches(lines[i])) out.push(`${relPosix}:${i + 1}: ${capLine(lines[i])}`);
     }
   };
   for (const s of starts) visit(s);

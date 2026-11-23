@@ -3,7 +3,10 @@ import { join } from "node:path";
 
 const EXCLUDED_DIRS = new Set([".git", "node_modules", ".obsidian"]);
 
-/** mtimeMs of every file under wiki/, keyed by repo-relative POSIX path. */
+/** Root files outside wiki/ that runs may update (ingest updates sha.log). */
+const ROOT_FILES = ["sha.log"];
+
+/** mtimeMs of every file under wiki/ plus ROOT_FILES, keyed by repo-relative POSIX path. */
 export function snapshotWiki(root: string): Map<string, number> {
   const snap = new Map<string, number>();
   const walk = (rel: string): void => {
@@ -20,6 +23,14 @@ export function snapshotWiki(root: string): Map<string, number> {
     walk("wiki");
   } catch (e) {
     if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
+  }
+  for (const f of ROOT_FILES) {
+    try {
+      const st = statSync(join(root, f));
+      if (st.isFile()) snap.set(f, st.mtimeMs);
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
+    }
   }
   return snap;
 }

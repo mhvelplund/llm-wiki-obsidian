@@ -91,6 +91,21 @@ describe("ApiEngine", () => {
     ]);
   });
 
+  it("joins text from separate tool turns with a blank line in deltas and done", async () => {
+    const { client } = fakeClient([
+      {
+        content: [text("Let me look."), use("t1", "read_file", { path: "sha.log" })],
+        stop_reason: "tool_use",
+        deltas: ["Let me look."],
+      },
+      { content: [text("Found it.")], stop_reason: "end_turn", deltas: ["Found ", "it."] },
+    ]);
+    const ev = await collect(new ApiEngine({ client, repoRoot: root, model: "m" }).run(req()));
+    const deltas = ev.filter((x) => x.type === "text-delta").map((x) => (x as { text: string }).text);
+    expect(deltas.join("")).toBe("Let me look.\n\nFound it.");
+    expect(ev.at(-1)).toEqual({ type: "done", text: "Let me look.\n\nFound it." });
+  });
+
   it("offers write tools only for save, never for chat", async () => {
     const a = fakeClient([{ content: [text("x")], stop_reason: "end_turn" }]);
     await collect(new ApiEngine({ client: a.client, repoRoot: root, model: "m" }).run(req("chat")));
