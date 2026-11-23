@@ -12,7 +12,7 @@ export type { LlmWikiSettings };
 
 function cliVersion(cliPath: string): Promise<string> {
   return new Promise((resolve, reject) => {
-    execFile(cliPath, ["--version"], { timeout: 15000, shell: process.platform === "win32" }, (err, stdout, stderr) => {
+    execFile(cliPath, ["--version"], { timeout: 15000 }, (err, stdout, stderr) => {
       if (err) reject(new Error((stderr || err.message).trim()));
       else resolve(stdout.trim());
     });
