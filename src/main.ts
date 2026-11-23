@@ -1,17 +1,18 @@
-import { FileSystemAdapter, Plugin, type WorkspaceLeaf } from "obsidian";
+import { FileSystemAdapter, Notice, Plugin, type WorkspaceLeaf } from "obsidian";
 import type { Engine } from "./engine/Engine";
 import { createEngine } from "./engine/createEngine";
-import { resolveDefaultRepoRoot } from "./repo";
+import { listWikiFolders, resolveDefaultRepoRoot, validateRepo } from "./repo";
+import { RunController } from "./runController";
 import { createSecrets, type Secrets } from "./secrets";
 import { DEFAULT_SETTINGS, LlmWikiSettingTab, type LlmWikiSettings } from "./settings";
 import { ChatView, VIEW_TYPE, type ChatAction } from "./view/ChatView";
+import { SaveModal, suggestName } from "./view/SaveModal";
 
 export default class LlmWikiChatPlugin extends Plugin {
   settings: LlmWikiSettings = { ...DEFAULT_SETTINGS };
   secrets!: Secrets;
-  /** Task 8 replaces this with the RunController/SaveModal wiring. */
-  onAction: (a: ChatAction) => void = () => {};
   private engine: Engine | { error: string } | null = null;
+  private controller: { engine: Engine; controller: RunController } | null = null;
 
   async onload(): Promise<void> {
     this.secrets = createSecrets(this.app);
@@ -20,7 +21,7 @@ export default class LlmWikiChatPlugin extends Plugin {
 
     this.registerView(VIEW_TYPE, (leaf) => {
       const view = new ChatView(leaf, this);
-      view.onAction = (a) => this.onAction(a);
+      view.onAction = (a) => void this.handleAction(view, a);
       return view;
     });
     this.addRibbonIcon("message-square", "Open wiki chat", () => void this.activateView());
@@ -70,6 +71,60 @@ export default class LlmWikiChatPlugin extends Plugin {
     return this.engine;
   }
 
+  /** One controller per cached engine, so chat, save and ingest share one busy guard. */
+  getController(): RunController | { error: string } {
+    const engine = this.getEngine();
+    if ("error" in engine) return engine;
+    if (this.controller?.engine !== engine) {
+      this.controller = { engine, controller: new RunController(engine, this.getRepoRoot()) };
+    }
+    return this.controller.controller;
+  }
+
+  private async handleAction(view: ChatView, a: ChatAction): Promise<void> {
+    if (a === "ingest" && this.settings.engine === "api") {
+      const msg = "Ingest requires the Claude Code engine";
+      new Notice(msg);
+      view.showError(msg);
+      return;
+    }
+    const controller = this.getController();
+    if ("error" in controller) return view.showError(controller.error);
+    if (controller.busy) return view.showError("A run is already in progress");
+    if (a === "ingest") {
+      void view.runStream((signal) => controller.ingest(signal), false);
+      return;
+    }
+    const root = this.getRepoRoot();
+    const repo = validateRepo(root);
+    if (!repo.ok) return view.showError(repo.reason);
+    let lastAnswer: string | undefined;
+    if (a === "save-last") {
+      lastAnswer = view.lastAnswer() ?? undefined;
+      if (lastAnswer === undefined) {
+        new Notice("No answer to save yet");
+        return;
+      }
+    } else if (view.transcript.length === 0) {
+      new Notice("Nothing to synthesize yet");
+      return;
+    }
+    const suggested = lastAnswer !== undefined ? suggestName(lastAnswer) : "";
+    new SaveModal(
+      this.app,
+      listWikiFolders(root),
+      suggested,
+      (folder, name) => {
+        void view.runStream(
+          (signal) =>
+            controller.save({ source: a === "save-last" ? "last" : "synthesis", lastAnswer, folder, name }, signal),
+          false,
+        );
+      },
+      root,
+    ).open();
+  }
+
   private async activateView(): Promise<ChatView | null> {
     const { workspace } = this.app;
     let leaf: WorkspaceLeaf | null = workspace.getLeavesOfType(VIEW_TYPE)[0] ?? null;
@@ -84,6 +139,6 @@ export default class LlmWikiChatPlugin extends Plugin {
 
   private async runAction(a: ChatAction): Promise<void> {
     const view = await this.activateView();
-    view?.onAction(a);
+    if (view) await this.handleAction(view, a);
   }
 }

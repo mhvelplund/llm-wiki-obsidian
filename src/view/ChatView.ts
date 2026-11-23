@@ -1,8 +1,12 @@
 import { ItemView, MarkdownRenderer, Notice, TFile, type WorkspaceLeaf, setTooltip } from "obsidian";
-import type { Engine, EngineEvent } from "../engine/Engine";
+import type { EngineEvent } from "../engine/Engine";
 import type LlmWikiChatPlugin from "../main";
-import { validateRepo } from "../repo";
+import type { ControllerEvent, ReportEvent } from "../runController";
 import { rewriteLinkForVault } from "./render";
+
+async function* errorStream(message: string): AsyncIterable<EngineEvent> {
+  yield { type: "error", message };
+}
 
 export const VIEW_TYPE = "llm-wiki-chat-view";
 
@@ -130,7 +134,7 @@ export class ChatView extends ItemView {
     this.sendBtn.disabled = this.busy && !running;
     const apiEngine = this.plugin.settings.engine === "api";
     for (const [action, btn] of this.actionBtns) {
-      btn.disabled = this.busy || (action === "ingest" && apiEngine);
+      btn.disabled = this.busy || running || (action === "ingest" && apiEngine);
       if (action === "ingest") setTooltip(btn, apiEngine ? INGEST_DISABLED_TIP : "Run the ingest workflow");
     }
   }
@@ -160,17 +164,24 @@ export class ChatView extends ItemView {
     const prompt = this.inputEl.value.trim();
     if (prompt === "") return;
     this.inputEl.value = "";
-    void this.runChat(prompt);
-  }
-
-  private async runChat(prompt: string): Promise<void> {
     this.transcript.push({ role: "user", text: prompt });
     this.messagesEl.createDiv({ cls: "llm-wiki-msg llm-wiki-user" }).createDiv({
       cls: "llm-wiki-bubble",
       text: prompt,
     });
     this.scrollToEnd();
+    void this.runStream((signal) => {
+      const c = this.plugin.getController();
+      return "error" in c ? errorStream(c.error) : c.chat(prompt, signal);
+    }, true);
+  }
 
+  /**
+   * Streams one run (chat, save or ingest) into the pane. Chat answers are recorded in the
+   * transcript; save/ingest runs end in a report (appended via appendReport) instead.
+   */
+  runStream(start: (signal: AbortSignal) => AsyncIterable<ControllerEvent>, record: boolean): Promise<void> {
+    if (this.abort) return Promise.resolve();
     const gen = this.generation;
     const abort = new AbortController();
     this.abort = abort; // set synchronously so Stop works and double sends are blocked
@@ -178,27 +189,25 @@ export class ChatView extends ItemView {
     const run = (async () => {
       await this.pendingReset;
       if (gen !== this.generation) return;
-      const engine = this.plugin.getEngine();
-      const repo = validateRepo(this.plugin.getRepoRoot());
-      if ("error" in engine) return this.showError(engine.error);
-      if (!repo.ok) return this.showError(repo.reason);
       try {
-        await this.streamAnswer(engine, prompt, abort.signal, gen);
+        await this.streamAnswer(start(abort.signal), record, gen);
       } catch (e) {
         if (gen === this.generation) this.showError(e instanceof Error ? e.message : String(e));
       }
     })();
     this.runPromise = run;
-    try {
-      await run;
-    } finally {
-      if (this.abort === abort) this.abort = null;
-      if (this.runPromise === run) this.runPromise = null;
-      this.refreshControls();
-    }
+    return (async () => {
+      try {
+        await run;
+      } finally {
+        if (this.abort === abort) this.abort = null;
+        if (this.runPromise === run) this.runPromise = null;
+        this.refreshControls();
+      }
+    })();
   }
 
-  private async streamAnswer(engine: Engine, prompt: string, signal: AbortSignal, gen: number): Promise<void> {
+  private async streamAnswer(events: AsyncIterable<ControllerEvent>, record: boolean, gen: number): Promise<void> {
     const msgEl = this.messagesEl.createDiv({ cls: "llm-wiki-msg llm-wiki-assistant" });
     let toolsEl: HTMLDetailsElement | null = null;
     let summaryEl: HTMLElement | null = null;
@@ -221,9 +230,12 @@ export class ChatView extends ItemView {
     };
 
     let terminal: EngineEvent | null = null;
+    let report: ReportEvent | null = null;
     try {
-      for await (const ev of engine.run({ kind: "chat", prompt, signal })) {
-        if (ev.type === "text-delta") {
+      for await (const ev of events) {
+        if (ev.type === "report") {
+          report = ev;
+        } else if (ev.type === "text-delta") {
           text += ev.text;
           schedule();
         } else if (ev.type === "tool-activity") {
@@ -246,6 +258,17 @@ export class ChatView extends ItemView {
     }
     if (gen !== this.generation) return; // New chat happened mid-run: discard everything
 
+    if (!record) {
+      // The report carries the final text, so drop the streamed body (keep tool activity).
+      bodyEl.remove();
+      if (!toolsEl) msgEl.remove();
+      if (terminal?.type === "error") this.showError(terminal.message);
+      if (report) {
+        this.appendReport(report.markdown);
+        if (report.openPath) void this.app.workspace.openLinkText(report.openPath, "", true);
+      }
+      return;
+    }
     if (terminal?.type === "error") {
       if (text === "") msgEl.remove();
       else await this.renderMarkdown(bodyEl, text);
@@ -265,7 +288,7 @@ export class ChatView extends ItemView {
     this.scrollToEnd();
   }
 
-  private showError(message: string): void {
+  showError(message: string): void {
     this.messagesEl.createDiv({ cls: "llm-wiki-msg llm-wiki-error" }).createDiv({
       cls: "llm-wiki-bubble",
       text: message,

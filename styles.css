@@ -21,3 +21,4 @@
 .llm-wiki-chat .llm-wiki-actions button { font-size: var(--font-ui-smaller); }
 .llm-wiki-chat .llm-wiki-input-row { display: flex; gap: var(--size-4-2); align-items: flex-end; }
 .llm-wiki-chat .llm-wiki-input { flex: 1; resize: none; border-radius: var(--radius-m); }
+.llm-wiki-modal-error { color: var(--text-error); min-height: 1.4em; }
